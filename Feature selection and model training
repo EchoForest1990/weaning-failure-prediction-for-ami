@@ -1,0 +1,596 @@
+import pandas as pd
+import numpy as np
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV, KFold, cross_val_predict
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LassoCV, Lasso, LogisticRegression
+from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (roc_auc_score, accuracy_score, recall_score, precision_score,
+                             f1_score, brier_score_loss, confusion_matrix, roc_curve, auc,
+                             log_loss, make_scorer)
+from sklearn.calibration import calibration_curve  
+from scipy.stats import randint, uniform, loguniform
+from scipy.stats import gaussian_kde
+from sklearn.base import clone
+from sklearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+from boruta import BorutaPy
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# -------------------- Plot style --------------------
+plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['ps.fonttype'] = 42
+plt.rcParams['figure.dpi'] = 300
+plt.rcParams['savefig.dpi'] = 600
+plt.rcParams['savefig.bbox'] = 'tight'
+plt.rcParams['font.size'] = 8
+plt.rcParams['axes.labelsize'] = 9
+plt.rcParams['axes.titlesize'] = 10
+plt.rcParams['xtick.labelsize'] = 8
+plt.rcParams['ytick.labelsize'] = 8
+plt.rcParams['legend.fontsize'] = 8
+plt.rcParams['axes.linewidth'] = 0.8
+plt.rcParams['xtick.major.width'] = 0.8
+plt.rcParams['ytick.major.width'] = 0.8
+plt.rcParams['xtick.direction'] = 'out'
+plt.rcParams['ytick.direction'] = 'out'
+plt.rcParams['axes.grid'] = False
+
+COLORS = {
+    'blue': '#1f4e79',
+    'red': '#a6192e',
+    'gray': '#4d4d4d',
+    'light_blue': '#b0c4de',
+    'light_gray': '#e0e0e0',
+    'orange': '#e3721f',
+    'teal': '#008b8b',
+    'purple': '#6c3483',
+    'confirmed': '#02BBC1',
+    'rejected': '#E53935',
+    'shadow': '#757575'
+}
+COLOR_CYCLE = [
+    COLORS['blue'], COLORS['red'], COLORS['orange'],
+    COLORS['teal'], COLORS['purple'], '#2ecc71', '#f1c40f', '#e67e22'
+]
+
+# -------------------- Helper functions --------------------
+def compute_auc_ci(y_true, y_score, n_bootstrap=1000, random_state=42):
+    np.random.seed(random_state)
+    n = len(y_true)
+    boot_scores = []
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(n, n, replace=True)
+        if np.sum(y_true[idx] == 1) == 0 or np.sum(y_true[idx] == 0) == 0:
+            continue
+        boot_scores.append(roc_auc_score(y_true[idx], y_score[idx]))
+    lower = np.percentile(boot_scores, 2.5)
+    upper = np.percentile(boot_scores, 97.5)
+    return lower, upper
+
+def hosmer_lemeshow(y_true, y_prob, groups=5):
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    order = np.argsort(y_prob)
+    y_true_sorted = y_true[order]
+    y_prob_sorted = y_prob[order]
+    n = len(y_true)
+    if n < groups:
+        return np.nan, np.nan
+    group_size = n // groups
+    observed = []
+    expected = []
+    for i in range(groups):
+        start = i * group_size
+        end = (i+1) * group_size if i < groups-1 else n
+        obs = np.sum(y_true_sorted[start:end])
+        exp = np.sum(y_prob_sorted[start:end])
+        observed.append(obs)
+        expected.append(exp)
+    observed = np.array(observed)
+    expected = np.array(expected)
+    group_sizes = np.full(groups, group_size)
+    group_sizes[-1] = n - (groups-1) * group_size
+    denominator = expected * (1 - expected / group_sizes)
+    if np.any(denominator <= 0):
+        return np.nan, np.nan
+    chi2_stat = np.sum((observed - expected)**2 / denominator)
+    try:
+        from scipy.stats import chi2
+        p_value = 1 - chi2.cdf(chi2_stat, groups-2)
+    except:
+        p_value = np.nan
+    return chi2_stat, p_value
+
+def evaluate_model_on_dataset(model, X, y, dataset_name, fill_method, model_name, threshold=0.5):
+    """
+    Evaluate a model on a given dataset and return performance metrics.
+    """
+    y_proba = model.predict_proba(X)[:, 1]
+    y_pred = (y_proba >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y, y_pred).ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0
+    auc_val = roc_auc_score(y, y_proba)
+    auc_lower, auc_upper = compute_auc_ci(y, y_proba)
+    acc = accuracy_score(y, y_pred)
+    recall = recall_score(y, y_pred)
+    precision = precision_score(y, y_pred)
+    f1 = f1_score(y, y_pred)
+    brier = brier_score_loss(y, y_proba)
+    logloss = log_loss(y, y_proba)
+    hl_stat, hl_p = hosmer_lemeshow(y, y_proba)
+    result = {
+        'dataset': dataset_name, 'fill_method': fill_method, 'model': model_name,
+        'AUC': auc_val, 'AUC_lower': auc_lower, 'AUC_upper': auc_upper,
+        'Accuracy': acc, 'Recall': recall, 'Precision': precision,
+        'Specificity': specificity, 'PPV': ppv, 'NPV': npv,
+        'F1': f1, 'Brier': brier, 'LogLoss': logloss,
+        'HL_pvalue': hl_p, 'Threshold_used': threshold
+    }
+    return result, y_proba, y_pred
+
+def find_optimal_threshold(estimator, X, y, cv=5, threshold_range=101):
+    """
+    Find the threshold that maximizes F1 score using cross-validated probabilities.
+    """
+    print("   Computing cross-validated probabilities for threshold selection...")
+    try:
+        y_proba_cv = cross_val_predict(estimator, X, y, cv=cv, method='predict_proba', n_jobs=-1)[:, 1]
+    except Exception as e:
+        print(f"   Cross-validation failed ({e}), using training set predictions instead.")
+        y_proba_cv = estimator.predict_proba(X)[:, 1]
+    thresholds = np.linspace(0, 1, threshold_range)
+    f1_scores = []
+    for th in thresholds:
+        y_pred_temp = (y_proba_cv >= th).astype(int)
+        if np.sum(y_pred_temp) == 0 or np.sum(y_pred_temp) == len(y_pred_temp):
+            f1_scores.append(0.0)
+        else:
+            f1_scores.append(f1_score(y, y_pred_temp))
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds[best_idx]
+    best_f1 = f1_scores[best_idx]
+    return best_threshold, best_f1
+
+def plot_combined_curves(y_true, model_data, fill_method, save_dir, suffix=''):
+    """
+    Plot ROC, calibration, and clinical impact curves for multiple models.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    for i, data in enumerate(model_data):
+        color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
+        fpr, tpr, _ = roc_curve(y_true, data['y_proba'])
+        roc_auc = auc(fpr, tpr)
+        axes[0].plot(fpr, tpr, color=color, lw=2,
+                     label=f"{data['name']} (AUC={roc_auc:.3f})")
+        fraction_pos, mean_pred = calibration_curve(y_true, data['y_proba'], n_bins=7, strategy='uniform')
+        axes[1].plot(mean_pred, fraction_pos, marker='o', color=color,
+                     label=data['name'], markersize=3, linewidth=1)
+        thresholds = np.linspace(0, 1, 101)
+        high_risk_counts = [np.sum(data['y_proba'] >= thresh) for thresh in thresholds]
+        event_counts = [np.sum((data['y_proba'] >= thresh) & (y_true == 1)) for thresh in thresholds]
+        axes[2].plot(thresholds, high_risk_counts, color=color, linestyle='-',
+                     label=f"{data['name']} (high risk)")
+        axes[2].plot(thresholds, event_counts, color=color, linestyle='--',
+                     label=f"{data['name']} (events)")
+    axes[0].plot([0, 1], [0, 1], 'k--', lw=1, label='Chance')
+    axes[0].set_xlim([0.0, 1.0]); axes[0].set_ylim([0.0, 1.05])
+    axes[0].set_xlabel('False Positive Rate'); axes[0].set_ylabel('True Positive Rate')
+    axes[0].set_title(f'ROC Curves - {fill_method}'); axes[0].legend(loc='lower right', fontsize=8)
+    axes[0].grid(alpha=0.15, linestyle='--')
+    axes[1].plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated')
+    axes[1].set_xlabel('Mean predicted probability'); axes[1].set_ylabel('Fraction of positives')
+    axes[1].set_title(f'Calibration Curves - {fill_method}'); axes[1].legend(loc='lower right', fontsize=8)
+    axes[1].grid(alpha=0.15, linestyle='--')
+    axes[2].set_xlabel('Threshold probability'); axes[2].set_ylabel('Number of patients')
+    axes[2].set_title(f'Clinical Impact Curves - {fill_method}'); axes[2].legend(loc='upper right', fontsize=8, ncol=2)
+    axes[2].grid(alpha=0.15, linestyle='--')
+    plt.suptitle(f'Model Performance - {fill_method}{suffix}', fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plot_path = os.path.join(save_dir, f'combined_curves{suffix}.png')
+    plt.savefig(plot_path, dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"Combined curves saved to {plot_path}")
+
+def plot_dca(y_true, y_probas_dict, model_names, save_path):
+    """
+    Decision curve analysis for multiple models.
+    """
+    thresholds = np.linspace(0, 1, 101)
+    plt.figure(figsize=(8, 6))
+    n = len(y_true)
+    for idx, name in enumerate(model_names):
+        y_prob = y_probas_dict[name]
+        color = COLOR_CYCLE[idx % len(COLOR_CYCLE)]
+        net_benefit = []
+        for thresh in thresholds:
+            tp = np.sum((y_true == 1) & (y_prob >= thresh))
+            fp = np.sum((y_true == 0) & (y_prob >= thresh))
+            nb = (tp / n) - (fp / n) * (thresh / (1 - thresh))
+            net_benefit.append(nb)
+        plt.plot(thresholds, net_benefit, label=name, linewidth=2, color=color)
+    all_tp = np.sum(y_true == 1)
+    all_nb_curve = [(all_tp / n) - ((n - all_tp) / n) * (th / (1 - th)) for th in thresholds]
+    plt.plot(thresholds, all_nb_curve, 'k--', label='Treat All')
+    plt.plot(thresholds, [0]*len(thresholds), 'k-', label='Treat None')
+    plt.xlim(0, 1.1)
+    plt.ylim(-0.1, 0.4)
+    plt.xlabel('Threshold Probability')
+    plt.ylabel('Net Benefit')
+    plt.title('Decision Curve Analysis')
+    plt.legend(loc='best')
+    plt.grid(alpha=0.15, linestyle='--')
+    plt.savefig(save_path, dpi=600, bbox_inches='tight')
+    plt.close()
+
+def plot_sensitivity_analysis(data, dataset_name, fill_order):
+    """
+    Bar plots of performance metrics across models for a given imputation method.
+    """
+    subset = data.drop_duplicates(subset=['fill_method', 'model'])
+    metrics_to_plot = ['AUC', 'Accuracy', 'Recall', 'Specificity', 'Precision', 'F1', 'Brier']
+    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+    axes = axes.flatten()
+    for idx, metric in enumerate(metrics_to_plot):
+        ax = axes[idx]
+        pivot = subset.pivot(index='fill_method', columns='model', values=metric)
+        pivot = pivot.reindex(fill_order)
+        x = np.arange(len(pivot.index))
+        width = 0.8 / len(pivot.columns)
+        for j, model in enumerate(pivot.columns):
+            color = COLOR_CYCLE[j % len(COLOR_CYCLE)]
+            ax.bar(x + (j - len(pivot.columns)/2 + 0.5) * width, pivot[model], width,
+                   label=model if idx == 0 else "", color=color, edgecolor='black')
+        ax.set_title(metric, fontsize=14)
+        ax.set_xticks(x)
+        ax.set_xticklabels(pivot.index, rotation=45, ha='right')
+        ax.set_ylim(0, 1.05)
+        ax.grid(axis='y', linestyle='--', alpha=0.15)
+    for idx in range(len(metrics_to_plot), len(axes)):
+        axes[idx].set_visible(False)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.02),
+               ncol=len(pivot.columns), fontsize=10)
+    plt.suptitle(f'Sensitivity Analysis - {dataset_name} Set (Original Models)', fontsize=16)
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    save_path = f'sensitivity_analysis_{dataset_name}_original.png'
+    plt.savefig(save_path, dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"Sensitivity analysis saved to {save_path}")
+
+# -------------------- Configuration --------------------
+train_file = 'AMI_IMV_train_mice_imputed.csv'
+test_file = 'AMI_IMV_test_mice_imputed.csv'
+target_col = 'extubation_failure'
+fill_method = 'MICE'
+
+# -------------------- Read data --------------------
+train_data = pd.read_csv(train_file)
+test_data = pd.read_csv(test_file)
+
+X_train = train_data.drop(target_col, axis=1)
+y_train = train_data[target_col]
+X_test = test_data.drop(target_col, axis=1)
+y_test = test_data[target_col]
+
+continuous_cols = train_data.columns[0:37].tolist()
+categorical_cols = train_data.columns[37:41].tolist()
+
+print(f"Number of continuous variables: {len(continuous_cols)}, categorical: {categorical_cols}")
+
+# -------------------- Scale continuous variables --------------------
+scaler = StandardScaler()
+X_train_cont_scaled = scaler.fit_transform(X_train[continuous_cols])
+X_test_cont_scaled = scaler.transform(X_test[continuous_cols])
+
+X_train_processed = np.hstack([X_train_cont_scaled, X_train[categorical_cols].values])
+X_test_processed = np.hstack([X_test_cont_scaled, X_test[categorical_cols].values])
+feature_names = continuous_cols + categorical_cols
+
+print(f"Processed feature matrix shape: {X_train_processed.shape}")
+
+# -------------------- Feature selection --------------------
+os.makedirs('feature_selection_plots', exist_ok=True)
+
+# 1. LassoCV
+print("\nStarting LassoCV feature selection...")
+alphas = np.logspace(-5, 1, 100)
+lasso_cv = LassoCV(alphas=alphas, cv=5, max_iter=10000, random_state=42)
+lasso_cv.fit(X_train_processed, y_train)
+best_alpha = lasso_cv.alpha_
+print(f"Best alpha: {best_alpha:.5f}")
+
+coef_abs = np.abs(lasso_cv.coef_)
+lasso_mask = coef_abs > 1e-6
+lasso_selected_features = np.array(feature_names)[lasso_mask].tolist()
+print(f"Lasso selected {len(lasso_selected_features)} features:")
+print(lasso_selected_features)
+
+# Lasso coefficient path
+plt.figure(figsize=(10, 6))
+alphas_path = lasso_cv.alphas_
+coefs = []
+for alpha in alphas_path:
+    lasso = Lasso(alpha=alpha, max_iter=10000, random_state=42)
+    lasso.fit(X_train_processed, y_train)
+    coefs.append(lasso.coef_)
+coefs = np.array(coefs)
+alphas_log = -np.log10(alphas_path)
+for i in range(coefs.shape[1]):
+    plt.plot(alphas_log, coefs[:, i], lw=1, alpha=0.7, color=COLORS['blue'])
+plt.axvline(-np.log10(best_alpha), color=COLORS['red'], linestyle='--', label='Best alpha')
+plt.xlabel('-log10(alpha)')
+plt.ylabel('Coefficient Value')
+plt.title('Lasso Coefficient Path')
+plt.legend()
+plt.grid(alpha=0.15, linestyle='--')
+plt.tight_layout()
+plt.savefig('feature_selection_plots/lasso_path.png', dpi=600, bbox_inches='tight')
+plt.close()
+print("Lasso coefficient path saved to feature_selection_plots/lasso_path.png")
+
+# Lasso CV error
+plt.figure(figsize=(10, 6))
+mean_mse = np.mean(lasso_cv.mse_path_, axis=1)
+std_mse = np.std(lasso_cv.mse_path_, axis=1)
+plt.errorbar(-np.log10(lasso_cv.alphas_), mean_mse, yerr=std_mse, fmt='o-', color=COLORS['teal'],
+             ecolor=COLORS['light_gray'], capsize=3, label='CV Mean MSE')
+plt.axvline(-np.log10(best_alpha), color=COLORS['red'], linestyle='--', label='Best alpha')
+plt.xlabel('-log10(alpha)')
+plt.ylabel('Mean Squared Error')
+plt.title('Lasso Cross-Validation Error')
+plt.legend()
+plt.grid(alpha=0.15, linestyle='--')
+plt.tight_layout()
+plt.savefig('feature_selection_plots/lasso_cv_error.png', dpi=600, bbox_inches='tight')
+plt.close()
+print("Lasso CV error saved to feature_selection_plots/lasso_cv_error.png")
+
+# 2. Boruta
+print("\nStarting Boruta feature selection...")
+rf = RandomForestClassifier(n_estimators=100, n_jobs=-1, random_state=42)
+boruta = BorutaPy(rf, n_estimators='auto', verbose=0, random_state=42, max_iter=200, perc=100)
+boruta.fit(X_train_processed, y_train)
+
+boruta_mask = boruta.support_
+boruta_selected_features = np.array(feature_names)[boruta_mask].tolist()
+print(f"Boruta selected {len(boruta_selected_features)} features:")
+print(boruta_selected_features)
+
+# Intersection of Lasso and Boruta
+intersect_features = list(set(lasso_selected_features).intersection(set(boruta_selected_features)))
+print(f"\nIntersection features count: {len(intersect_features)}")
+print(f"Intersection features: {intersect_features}")
+
+if len(intersect_features) == 0:
+    print("Warning: Intersection is empty! Using Lasso features as fallback.")
+    intersect_features = lasso_selected_features
+
+intersect_indices = [feature_names.index(f) for f in intersect_features]
+X_train_sel = X_train_processed[:, intersect_indices]
+X_test_sel = X_test_processed[:, intersect_indices]
+print(f"Final training set shape: {X_train_sel.shape}")
+
+# -------------------- Model definition and hyperparameter tuning --------------------
+base_models = {
+    "Logistic Regression": LogisticRegression(random_state=42, max_iter=3000, class_weight='balanced'),
+    "SVM": SVC(probability=True, random_state=42, class_weight='balanced'),
+    "Decision Tree": DecisionTreeClassifier(random_state=42, class_weight='balanced'),
+    "Random Forest": RandomForestClassifier(random_state=42, class_weight='balanced'),
+    "XGBoost": XGBClassifier(eval_metric='logloss', use_label_encoder=False, random_state=42),
+    "LightGBM": LGBMClassifier(random_state=42, verbosity=-1),
+    "CatBoost": CatBoostClassifier(silent=True, random_state=42, auto_class_weights='Balanced'),
+    "MLP": MLPClassifier(random_state=42, max_iter=500, early_stopping=True,
+                         validation_fraction=0.1, n_iter_no_change=10)
+}
+
+param_distributions = {
+    "Logistic Regression": {
+        'classifier__C': loguniform(1e-3, 1e2),
+        'classifier__penalty': ['l1', 'l2', 'elasticnet'],
+        'classifier__solver': ['liblinear', 'saga'],
+        'classifier__l1_ratio': uniform(0.1, 0.9),
+    },
+    "SVM": {
+        'classifier__C': loguniform(1e-3, 1e2),
+        'classifier__kernel': ['linear', 'rbf'],
+        'classifier__gamma': ['scale', 'auto'] + list(loguniform(1e-3, 1e1).rvs(3, random_state=42)),
+    },
+    "Decision Tree": {
+        'classifier__max_depth': randint(3, 20),
+        'classifier__min_samples_split': randint(2, 20),
+        'classifier__min_samples_leaf': randint(1, 15),
+        'classifier__max_features': ['sqrt', 'log2', None],
+        'classifier__criterion': ['gini', 'entropy'],
+    },
+    "Random Forest": {
+        'classifier__n_estimators': randint(100, 500),
+        'classifier__max_depth': randint(3, 20),
+        'classifier__min_samples_split': randint(2, 20),
+        'classifier__min_samples_leaf': randint(1, 15),
+        'classifier__max_features': ['sqrt', 'log2', None],
+        'classifier__bootstrap': [True, False],
+    },
+    "XGBoost": {
+        'classifier__n_estimators': randint(100, 500),
+        'classifier__learning_rate': loguniform(1e-3, 1),
+        'classifier__max_depth': randint(3, 15),
+        'classifier__subsample': uniform(0.6, 0.4),
+        'classifier__colsample_bytree': uniform(0.6, 0.4),
+        'classifier__reg_alpha': loguniform(1e-3, 10),
+        'classifier__reg_lambda': loguniform(1e-3, 10),
+    },
+    "LightGBM": {
+        'classifier__n_estimators': randint(100, 500),
+        'classifier__learning_rate': loguniform(1e-3, 1),
+        'classifier__max_depth': randint(3, 15),
+        'classifier__num_leaves': randint(20, 100),
+        'classifier__subsample': uniform(0.6, 0.4),
+        'classifier__colsample_bytree': uniform(0.6, 0.4),
+        'classifier__reg_alpha': loguniform(1e-3, 10),
+        'classifier__reg_lambda': loguniform(1e-3, 10),
+    },
+    "CatBoost": {
+        'classifier__iterations': randint(100, 500),
+        'classifier__learning_rate': loguniform(1e-3, 1),
+        'classifier__depth': randint(3, 12),
+        'classifier__l2_leaf_reg': loguniform(1e-3, 10),
+        'classifier__border_count': randint(32, 255),
+        'classifier__subsample': uniform(0.6, 0.4),
+    },
+    "MLP": {
+        'classifier__hidden_layer_sizes': [(5,), (10,), (20,), (10,5), (20,10)],
+        'classifier__activation': ['relu', 'tanh', 'logistic'],
+        'classifier__solver': ['adam', 'sgd'],
+        'classifier__alpha': loguniform(1e-5, 1e-1),
+        'classifier__learning_rate_init': loguniform(1e-4, 1e-1),
+        'classifier__max_iter': [500],
+        'classifier__early_stopping': [True, False],
+    }
+}
+
+pos_count = np.sum(y_train == 1)
+neg_count = np.sum(y_train == 0)
+scale_pos_weight = pos_count / neg_count if pos_count > 0 else 1.0
+print(f"scale_pos_weight = {scale_pos_weight:.4f}")
+
+# Prepare models for tuning (set scale_pos_weight for XGBoost/LightGBM)
+models_for_tuning = {}
+for name, clf in base_models.items():
+    clf_copy = clone(clf)
+    if name in ["XGBoost", "LightGBM"]:
+        clf_copy.set_params(scale_pos_weight=scale_pos_weight)
+    models_for_tuning[name] = clf_copy
+
+print("\nStarting hyperparameter optimization (random search, 5-fold CV)...")
+best_pipelines = {}
+for model_name, base_clf in models_for_tuning.items():
+    print(f"--- Tuning {model_name} ---")
+    pipeline = Pipeline([('classifier', base_clf)])
+    param_space = param_distributions[model_name].copy()
+    if model_name in ["XGBoost", "LightGBM"]:
+        param_space['classifier__scale_pos_weight'] = [scale_pos_weight]
+    random_search = RandomizedSearchCV(
+        estimator=pipeline,
+        param_distributions=param_space,
+        n_iter=30,
+        cv=StratifiedKFold(5, shuffle=True, random_state=42),
+        scoring=make_scorer(roc_auc_score, needs_proba=True),
+        n_jobs=-1,
+        random_state=42,
+        verbose=0
+    )
+    random_search.fit(X_train_sel, y_train)
+    best_pipelines[model_name] = random_search.best_estimator_
+    print(f"  Best CV AUC: {random_search.best_score_:.4f}")
+
+# Train final models with best hyperparameters
+print("\nTraining final models...")
+final_models = {}
+os.makedirs('models', exist_ok=True)
+for model_name, best_estimator in best_pipelines.items():
+    final_clf = clone(base_models[model_name])
+    best_params = best_estimator.named_steps['classifier'].get_params()
+    final_clf.set_params(**best_params)
+    if model_name in ["XGBoost", "LightGBM"]:
+        final_clf.set_params(scale_pos_weight=scale_pos_weight)
+    final_pipeline = Pipeline([('classifier', final_clf)])
+    final_pipeline.fit(X_train_sel, y_train)
+    final_models[model_name] = final_pipeline
+    model_path = os.path.join('models', f'{fill_method}_{model_name}_final.pkl')
+    joblib.dump(final_pipeline, model_path)
+    print(f"  Saved {model_name} model to {model_path}")
+
+# -------------------- Find optimal thresholds for original models --------------------
+print("\nComputing optimal classification thresholds for each original model...")
+optimal_thresholds_orig = {}
+for model_name, pipeline in final_models.items():
+    best_th, best_f1 = find_optimal_threshold(pipeline, X_train_sel, y_train, cv=5)
+    optimal_thresholds_orig[model_name] = best_th
+    print(f"  {model_name} optimal threshold = {best_th:.3f} (CV F1 = {best_f1:.3f})")
+
+# -------------------- Evaluate original models on train and test sets --------------------
+all_results = []
+os.makedirs('plots_train', exist_ok=True)
+os.makedirs('plots_test', exist_ok=True)
+os.makedirs('test_predictions', exist_ok=True)
+
+train_probas_orig = {}
+test_probas_orig = {}
+
+print("\nEvaluating original models with optimal thresholds...")
+for model_name, pipeline in final_models.items():
+    th = optimal_thresholds_orig[model_name]
+    print(f"\n--- Original {model_name} (threshold = {th:.3f}) ---")
+
+    # Train set
+    result_train, y_proba_train, _ = evaluate_model_on_dataset(
+        pipeline, X_train_sel, y_train, 'train', fill_method, model_name,
+        threshold=th
+    )
+    all_results.append(result_train)
+    train_probas_orig[model_name] = y_proba_train
+    print(f"  Train: Recall = {result_train['Recall']:.3f}, Precision = {result_train['Precision']:.3f}, F1 = {result_train['F1']:.3f}")
+
+    # Test set
+    result_test, y_proba_test, y_pred_test = evaluate_model_on_dataset(
+        pipeline, X_test_sel, y_test, 'test', fill_method, model_name,
+        threshold=th
+    )
+    all_results.append(result_test)
+    test_probas_orig[model_name] = y_proba_test
+    print(f"  Test : Recall = {result_test['Recall']:.3f}, Precision = {result_test['Precision']:.3f}, F1 = {result_test['F1']:.3f}")
+
+    # Save test predictions
+    pred_df = pd.DataFrame({'True_Label': y_test, 'Pred_Prob': y_proba_test, 'Pred_Label': y_pred_test})
+    pred_df.index.name = 'PatientID'
+    pred_df.to_csv(os.path.join('test_predictions', f'{fill_method}_{model_name}_predictions.csv'))
+
+# -------------------- Plotting --------------------
+model_data_train = [{'name': name, 'y_proba': train_probas_orig[name]} for name in final_models.keys()]
+plot_combined_curves(y_train, model_data_train, fill_method, 'plots_train', suffix='_original')
+plot_dca(y_train, train_probas_orig, list(final_models.keys()), os.path.join('plots_train', 'dca_original.png'))
+
+model_data_test = [{'name': name, 'y_proba': test_probas_orig[name]} for name in final_models.keys()]
+plot_combined_curves(y_test, model_data_test, fill_method, 'plots_test', suffix='_original')
+plot_dca(y_test, test_probas_orig, list(final_models.keys()), os.path.join('plots_test', 'dca_original.png'))
+
+# -------------------- Save results --------------------
+df_results = pd.DataFrame(all_results)
+df_results.to_csv('all_results.csv', index=False)
+print("\nAll results saved to all_results.csv")
+
+# Sensitivity analysis (only original models)
+fill_order = [fill_method]
+train_results = df_results[df_results['dataset'] == 'train']
+test_results = df_results[df_results['dataset'] == 'test']
+
+plot_sensitivity_analysis(train_results, 'train', fill_order)
+plot_sensitivity_analysis(test_results, 'test', fill_order)
+
+# -------------------- Save artifacts for deployment --------------------
+joblib.dump(scaler, 'scaler.pkl')
+joblib.dump(intersect_features, 'final_features.pkl')
+joblib.dump(continuous_cols, 'continuous_cols.pkl')
+joblib.dump(categorical_cols, 'categorical_cols.pkl')
+print("Artifacts saved: scaler.pkl, final_features.pkl, continuous_cols.pkl, categorical_cols.pkl")
+
+print("\nAll tasks completed!")
+print("Output files: all_results.csv, models in models/, predictions in test_predictions/, plots in plots_train/ and plots_test/")
+print("Feature selection plots are in feature_selection_plots/")
